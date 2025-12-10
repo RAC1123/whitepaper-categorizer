@@ -14,9 +14,18 @@ from datetime import datetime
 
 import pdfplumber
 import requests
-from flask import Flask, request, redirect, url_for, render_template_string, send_file
+from flask import (
+    Flask,
+    request,
+    redirect,
+    url_for,
+    render_template_string,
+    send_file,
+)
 from openai import OpenAI
 from werkzeug.utils import secure_filename
+
+# ---------------------- CONFIG ----------------------
 
 DB_PATH = "whitepapers.db"
 UPLOAD_FOLDER = "uploads"
@@ -30,11 +39,205 @@ INDUSTRIES = [
 
 MAIN_CATEGORIES = ["Retail", "Institutional", "Nondescript"]
 
+# ---------------------- HELPER FUNCTIONS ----------------------
+
+def ensure_upload_folder():
+    """Make sure uploads folder exists."""
+    if not os.path.isdir(UPLOAD_FOLDER):
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+def init_db():
+    """Create the SQLite database and whitepapers table if they don't exist."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS whitepapers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            source TEXT,
+            main_category TEXT,
+            industry TEXT,
+            short_summary TEXT,
+            file_path TEXT,
+            created_at TEXT
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+def save_whitepaper(title, source, main_category, industry, short_summary, file_path=None):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO whitepapers (title, source, main_category, industry, short_summary, file_path, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?);
+    """, (title, source, main_category, industry, short_summary, file_path, datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
+
+def delete_whitepaper(wp_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    # Remove file from disk if we have one
+    cur.execute("SELECT file_path FROM whitepapers WHERE id = ?;", (wp_id,))
+    row = cur.fetchone()
+    if row and row[0]:
+        try:
+            if os.path.isfile(row[0]):
+                os.remove(row[0])
+        except OSError:
+            # Don't crash if file is missing
+            pass
+    cur.execute("DELETE FROM whitepapers WHERE id = ?;", (wp_id,))
+    conn.commit()
+    conn.close()
+
+def load_whitepapers():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, title, source, main_category, industry, short_summary, file_path, created_at
+        FROM whitepapers;
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {
+            "id": r[0],
+            "title": r[1],
+            "source": r[2],
+            "main_category": r[3],
+            "industry": r[4],
+            "short_summary": r[5],
+            "file_path": r[6],
+            "created_at": r[7],
+        }
+        for r in rows
+    ]
+
+def extract_text(pdf_bytes: bytes) -> str:
+    text_parts = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            text_parts.append(page.extract_text() or "")
+    return "\n".join(text_parts)
+
+def classify(api_key: str, text: str) -> dict:
+    client = OpenAI(api_key=api_key)
+    snippet = text[:8000]
+
+    system_prompt = (
+        "You classify financial whitepapers by intended audience and industry and provide a short summary.\n\n"
+        "Your primary task is to determine whether the document is intended for:\n"
+        "- Institutional investors\n"
+        "- Retail (general public) investors\n"
+        "- Or if the audience is truly unclear (Nondescript).\n\n"
+        "DEFINITIONS (INTENDED AUDIENCE):\n"
+        "Institutional:\n"
+        "- Intended for professional or sophisticated investors: pension funds, hedge funds, endowments, "
+        "foundations, banks, insurance companies, asset managers, institutional consultants, sovereign wealth funds, "
+        "corporate treasurers, etc.\n"
+        "- Common signals: fiduciary duty, funding ratios, ALM, risk budgeting, mandate guidelines, RFQs/RFPs, "
+        "benchmarks relative to institutional indices, regulatory capital, Solvency II, Basel, UCITS, complex "
+        "derivatives, factor models, tracking error, ex-ante risk, multi-asset portfolio construction, "
+        "liability-driven investing, overlays, optimization.\n"
+        "- Writing style: assumes strong finance knowledge, heavy jargon, equations, quantitative methods, "
+        "regulatory or policy detail, references to institutional asset allocation frameworks.\n\n"
+        "Retail:\n"
+        "- Intended for the general public or non-professional investors.\n"
+        "- Common signals: basic investor education, explainers of what a bond/ETF/stock is, budgeting, saving, "
+        "retirement basics, high-level product overviews, marketing to individuals, examples using everyday situations.\n"
+        "- Writing style: plain language, defines basic terms, focuses on concepts like diversification and risk "
+        "without deep math or institutional jargon.\n\n"
+        "Nondescript:\n"
+        "- Use ONLY when the audience is genuinely ambiguous and cannot reasonably be inferred.\n"
+        "- Do NOT overuse this; if the language is clearly technical and finance-heavy, prefer Institutional.\n\n"
+        "INDUSTRY:\n"
+        "Choose one primary industry from this list only:\n"
+        + ", ".join(INDUSTRIES) + "\n\n"
+        "OUTPUT FORMAT (STRICT JSON ONLY):\n"
+        "Respond ONLY with valid JSON in this exact structure, no extra text:\n"
+        "{\n"
+        "  \"title\": \"short inferred title\",\n"
+        "  \"audience\": \"Institutional\" | \"Retail\" | \"Nondescript\",\n"
+        "  \"audience_confidence\": integer 0-100,\n"
+        "  \"audience_rationale\": \"one or two sentences explaining why\",\n"
+        "  \"industry\": \"one industry from the list\",\n"
+        "  \"short_summary\": \"2-3 sentence summary aimed at a financially literate reader\"\n"
+        "}\n"
+        "Do NOT include comments, trailing commas, or any text before or after the JSON."
+    )
+
+    user_prompt = (
+        "Classify and summarize the following financial whitepaper text.\n\n"
+        "Remember:\n"
+        "- audience must be based on intended user: institutional vs retail vs nondescript.\n"
+        "- industry must be one of the allowed industries.\n"
+        "- audience_confidence is your confidence (0-100) in your audience choice.\n"
+        "- audience_rationale should concisely explain the reasoning.\n\n"
+        "Text:\n" + snippet
+    )
+
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0
+    )
+
+    content = response.choices[0].message.content.strip()
+    print("RAW MODEL RESPONSE:", repr(content))
+
+    json_str = content
+    first_brace = content.find("{")
+    last_brace = content.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        json_str = content[first_brace:last_brace + 1]
+
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            "Model did not return valid JSON.\n\n"
+            "Raw reply was:\n"
+            f"{content}\n\n"
+            f"JSON error: {e}"
+        )
+
+    title = data.get("title", "Untitled").strip()
+    audience = data.get("audience", "Nondescript").strip()
+    industry = data.get("industry", "Other").strip()
+    short_summary = data.get("short_summary", "").strip()
+
+    if audience not in MAIN_CATEGORIES:
+        main_category = "Nondescript"
+    else:
+        main_category = audience
+
+    if industry not in INDUSTRIES:
+        industry = "Other"
+
+    return {
+        "title": title,
+        "main_category": main_category,
+        "industry": industry,
+        "short_summary": short_summary,
+        "audience": audience,
+        "audience_confidence": data.get("audience_confidence", 0),
+        "audience_rationale": data.get("audience_rationale", "").strip(),
+    }
+
+# ---------------------- FLASK APP SETUP ----------------------
+
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
+# On import (both locally and on Render), set up folders and DB
 ensure_upload_folder()
 init_db()
+
 
 HTML_TEMPLATE = """
 <!doctype html>
