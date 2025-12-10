@@ -33,6 +33,9 @@ MAIN_CATEGORIES = ["Retail", "Institutional", "Nondescript"]
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
+ensure_upload_folder()
+init_db()
+
 HTML_TEMPLATE = """
 <!doctype html>
 <html>
@@ -576,6 +579,4 @@ def download_whitepaper(wp_id: int):
     return send_file(file_path, as_attachment=True, download_name=filename)
 
 if __name__ == "__main__":
-    ensure_upload_folder()
-    init_db()
     app.run(debug=True)
